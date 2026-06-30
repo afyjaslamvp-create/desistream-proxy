@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/proxy.mjs": {
-      "maxDuration": 10
-    }
-  }
-}
