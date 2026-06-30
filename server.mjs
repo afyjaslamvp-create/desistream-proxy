@@ -1,163 +1,159 @@
+import { chromium } from 'playwright';
 import http from 'http';
 import url from 'url';
 
 const PORT = process.env.PORT || 3000;
 
-async function fetchText(u) {
-  const r = await fetch(u, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-      'Referer': 'https://vidsrc.to/',
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
+let browser;
+
+async function init() {
+  browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-gpu', '--disable-dev-shm-usage',
+      '--single-process', '--no-zygote',
+      '--disable-accelerated-2d-canvas', '--disable-software-rasterizer',
+    ],
   });
-  return r.text();
 }
 
-const PROVIDERS = [
-  // Provider 1: vidsrc.vc (simple direct embeds)
-  {
-    name: 'VidSrcVC',
-    extract: async (tmdbId, type) => {
-      const t = type === 'movie' ? 'movie' : 'tv';
-      const html = await fetchText(`https://vidsrc.vc/embed/${t}/${tmdbId}`);
-      // Look for direct video URL in the page
-      const m3u8 = html.match(/https?[^"'\s<>]+\.m3u8[^"'\s<>]*/);
-      if (m3u8) return m3u8[0];
-      // Look for iframe with source
-      const iframe = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-      if (iframe) {
-        const iframeHtml = await fetchText(iframe[1]);
-        const m = iframeHtml.match(/https?[^"'\s<>]+\.m3u8[^"'\s<>]*/);
-        if (m) return m[0];
-      }
-      return null;
-    }
-  },
+async function extractFromPage(pageUrl) {
+  const ctx = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    viewport: { width: 1280, height: 720 },
+  });
+  const page = await ctx.newPage();
+  let m3u8 = null;
 
-  // Provider 2: superembed (direct stream URLs in page source)
-  {
-    name: 'SuperEmbed',
-    extract: async (tmdbId, type) => {
-      const t = type === 'movie' ? 'movie' : 'tv';
-      const html = await fetchText(`https://multiembed.mov/?video_id=${tmdbId}&tmdb=1`);
-      const m3u8 = html.match(/https?[^"'\s<>]+\.m3u8[^"'\s<>]*/);
-      if (m3u8) return m3u8[0];
-      const mp4 = html.match(/https?[^"'\s<>]+\.mp4[^"'\s<>]*/);
-      if (mp4) return mp4[0];
-      return null;
-    }
-  },
+  await page.route('**/*', (route) => {
+    const rt = route.request().resourceType();
+    if (['image', 'stylesheet', 'font', 'media'].includes(rt))
+      return route.abort();
+    route.continue();
+  });
 
-  // Provider 3: embed.su (search for direct sources)
-  {
-    name: 'EmbedSu',
-    extract: async (tmdbId, type) => {
-      const t = type === 'movie' ? 'movie' : 'tv';
-      const html = await fetchText(`https://embed.su/embed/${t}/${tmdbId}`);
-      const m3u8 = html.match(/https?[^"'\s<>]+\.m3u8[^"'\s<>]*/);
-      if (m3u8) return m3u8[0];
-      const iframe = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-      if (iframe) {
+  page.on('request', (req) => {
+    const u = req.url();
+    if (u.includes('.m3u8')) m3u8 = u.split('?')[0];
+  });
+
+  page.on('response', (res) => {
+    const u = res.url();
+    if (u.includes('.m3u8')) m3u8 = u.split('?')[0];
+  });
+
+  // Load embed page
+  try {
+    console.log(`  Loading ${pageUrl}`);
+    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.waitForTimeout(5000);
+  } catch {}
+
+  // Check for video or player
+  if (!m3u8) {
+    try {
+      m3u8 = await page.evaluate(() => {
+        const v = document.querySelector('video');
+        if (v?.src) return v.src;
+        const s = v?.querySelector('source');
+        if (s?.src) return s.src;
+        const allS = document.querySelectorAll('source');
+        for (const src of allS) { if (src.src) return src.src; }
+        // If no video, check for iframe
+        const ifr = document.querySelector('iframe');
+        return ifr?.src || null;
+      });
+
+      // If we got an iframe URL (not m3u8), follow it
+      if (m3u8 && !m3u8.includes('.m3u8') && !m3u8.includes('.mp4')) {
+        const iframeUrl = m3u8;
+        m3u8 = null;
+        console.log(`  Following iframe: ${iframeUrl}`);
         try {
-          const iframeHtml = await fetchText(iframe[1]);
-          const m = iframeHtml.match(/https?[^"'\s<>]+\.m3u8[^"'\s<>]*/);
-          if (m) return m[0];
+          await page.goto(iframeUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await page.waitForTimeout(8000);
         } catch {}
+        // Check for video/m3u8 in iframe page
+        if (!m3u8) {
+          try {
+            m3u8 = await page.evaluate(() => {
+              const v = document.querySelector('video');
+              if (v?.src) return v.src;
+              const s = v?.querySelector('source');
+              if (s?.src) return s.src;
+              return null;
+            });
+          } catch {}
+        }
       }
-      return null;
-    }
-  },
+    } catch {}
+  }
 
-  // Provider 4: 2embed
-  {
-    name: '2Embed',
-    extract: async (tmdbId, type) => {
-      const t = type === 'movie' ? 'movie' : 'tv';
-      const html = await fetchText(`https://www.2embed.cc/embed/${t}/${tmdbId}`);
-      const m3u8 = html.match(/https?[^"'\s<>]+\.m3u8[^"'\s<>]*/);
-      if (m3u8) return m3u8[0];
-      return null;
-    }
-  },
-
-  // Provider 5: vidsrc.to (complex - try to extract iframe source)
-  {
-    name: 'VidSrcTo',
-    extract: async (tmdbId, type) => {
-      const t = type === 'movie' ? 'movie' : 'tv';
-      const html = await fetchText(`https://vidsrc.to/embed/${t}/${tmdbId}`);
-      // Look for any video URL pattern
-      const all = html.match(/https?[^"'\s<>]++\.(?:m3u8|mp4)[^"'\s<>]*/gi);
-      if (all && all.length) return all[0];
-      // Look for iframe
-      const iframe = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-      if (iframe) {
-        try {
-          const iframeHtml = await fetchText(iframe[1]);
-          const m = iframeHtml.match(/https?[^"'\s<>]+\.m3u8[^"'\s<>]*/);
-          if (m) return m[0];
-        } catch {}
-      }
-      return null;
-    }
-  },
-
-  // Provider 6: 2embed.skin (another 2embed variant)
-  {
-    name: '2EmbedSkin',
-    extract: async (tmdbId, type) => {
-      const t = type === 'movie' ? 'movie' : 'tv';
-      const html = await fetchText(`https://www.2embed.skin/embed/${t}/${tmdbId}`);
-      const m3u8 = html.match(/https?[^"'\s<>]+\.m3u8[^"'\s<>]*/);
-      if (m3u8) return m3u8[0];
-      return null;
-    }
-  },
-];
+  await ctx.close();
+  return m3u8;
+}
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   if (req.method === 'OPTIONS') return res.end();
 
   const p = url.parse(req.url, true);
-  const m = p.pathname.match(/^\/api\/streams\/(movie|tv)\/(\d+)/i);
 
+  if (p.pathname === '/api/health') {
+    return res.end(JSON.stringify({ ok: true }));
+  }
+
+  const m = p.pathname.match(/^\/api\/streams\/(movie|tv)\/(\d+)/i);
   if (!m) {
-    if (p.pathname === '/api/health' || p.pathname === '/api/test') {
-      return res.end(JSON.stringify({ ok: true }));
-    }
     return res.writeHead(404).end(JSON.stringify({ error: 'use /api/streams/movie/:id' }));
   }
 
   const tmdbId = m[2];
   const type = m[1];
-  const results = {};
-  let foundAny = false;
+  const t = type === 'movie' ? 'movie' : 'tv';
 
+  // Try multiple providers, stop at first success
+  const providers = [
+    `https://vidsrc.to/embed/${t}/${tmdbId}`,
+    `https://vidsrc.pm/embed/${t}/${tmdbId}`,
+    `https://embed.su/embed/${t}/${tmdbId}`,
+    `https://www.2embed.cc/embed/${t}/${tmdbId}`,
+  ];
+
+  let streamUrl = null;
+  let providerName = null;
   console.log(`\nExtract ${type}/${tmdbId}`);
-  for (const prov of PROVIDERS) {
+
+  for (const provUrl of providers) {
+    const name = provUrl.split('/')[2];
     try {
-      const url = await prov.extract(tmdbId, type);
-      if (url) {
-        results[prov.name] = url;
-        foundAny = true;
-        console.log(`  ${prov.name}: FOUND ${url.substring(0, 80)}`);
-      } else {
-        console.log(`  ${prov.name}: no stream`);
+      const hls = await extractFromPage(provUrl);
+      if (hls && (hls.includes('.m3u8') || hls.includes('.mp4'))) {
+        streamUrl = hls;
+        providerName = name;
+        console.log(`  ${name}: FOUND ${hls.substring(0, 100)}`);
+        break;
       }
+      console.log(`  ${name}: no stream`);
     } catch (e) {
-      console.log(`  ${prov.name}: error ${e.message}`);
+      console.log(`  ${name}: error ${e.message}`);
     }
   }
 
   res.end(JSON.stringify({
-    success: foundAny,
+    success: !!streamUrl,
     tmdbId, type,
-    count: Object.keys(results).length,
-    streams: results,
+    url: streamUrl,
+    type_hint: streamUrl?.includes('.m3u8') ? 'hls' : streamUrl?.includes('.mp4') ? 'mp4' : undefined,
+    provider: providerName,
+    streams: streamUrl ? { [providerName]: { url: streamUrl } } : {},
   }));
 });
 
-server.listen(PORT, () => console.log(`Direct fetch proxy on :${PORT}`));
+init().then(() => {
+  server.listen(PORT, () => console.log(`Ready :${PORT}`));
+}).catch(e => {
+  console.error('Browser launch failed:', e);
+  process.exit(1);
+});
