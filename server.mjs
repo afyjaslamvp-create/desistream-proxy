@@ -1,77 +1,93 @@
+import { chromium } from 'playwright';
 import http from 'http';
-import https from 'https';
 import url from 'url';
+
 const PORT = process.env.PORT || 3000;
+const TIMEOUT = 30000;
 
-function fetch(u) {
-  const mod = u.startsWith('https') ? https : http;
-  return new Promise((resolve, reject) => {
-    const req = mod.get(u, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 15000 }, res => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => resolve({ status: res.statusCode, data, headers: res.headers }));
+const PROVIDERS = [
+  { name: 'VidSrc', build: (t, id) => `https://vidsrc.to/embed/${t}/${id}` },
+  { name: 'VidSrcPM', build: (t, id) => `https://vidsrc.pm/embed/${t}/${id}` },
+  { name: '2Embed', build: (t, id) => `https://www.2embed.cc/embed/${t}/${id}` },
+  { name: 'EmbedSu', build: (t, id) => `https://embed.su/embed/${t}/${id}` },
+  { name: 'MultiEmbed', build: (t, id) => `https://multiembed.mov/?video_id=${id}&tmdb=1` },
+  { name: 'VidCore', build: (t, id) => `https://www.vidcore.org/embed/${t}/${id}` },
+  { name: 'LetsEmbed', build: (t, id) => `https://letsembed.cc/embed/${t}/?id=${id}` },
+  { name: 'DXStream', build: (t, id) => `https://scylla.dxstream.net/embed/${id}` },
+];
+
+async function extractFromBrowser(pageUrl) {
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  try {
+    const ctx = await browser.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' });
+    const page = await ctx.newPage();
+    let hlsUrl = null;
+
+    page.on('response', async (res) => {
+      const u = res.url();
+      if (u.includes('.m3u8')) hlsUrl = u;
     });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-  });
-}
 
-async function tryEmbedSu(tmdbId, type) {
-  try {
-    const ep = type === 'movie' ? `movie/${tmdbId}` : `tv/${tmdbId}/1/1`;
-    const r = await fetch(`https://embed.su/api/embed/${ep}`);
-    if (r.status === 200) {
-      const d = JSON.parse(r.data);
-      if (d?.url) return { url: d.url, type: d.url.includes('.m3u8') ? 'hls' : 'mp4' };
+    page.on('request', (req) => {
+      const u = req.url();
+      if (u.includes('.m3u8')) hlsUrl = u;
+    });
+
+    try {
+      await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: TIMEOUT });
+      await page.waitForTimeout(3000);
+    } catch {}
+
+    if (!hlsUrl) {
+      hlsUrl = await page.evaluate(() => {
+        const v = document.querySelector('video');
+        if (v) return v.src || v.querySelector('source')?.src || null;
+        const iframe = document.querySelector('iframe');
+        return iframe?.src || null;
+      });
     }
-  } catch {}
-  return null;
-}
 
-async function tryMultiEmbed(tmdbId, type) {
-  try {
-    const r = await fetch(`https://multiembed.mov/api/stream?tmdbId=${tmdbId}&type=${type}`);
-    if (r.status === 200) {
-      const d = JSON.parse(r.data);
-      if (d?.url) return { url: d.url, type: d.url.includes('.m3u8') ? 'hls' : 'mp4' };
-    }
-  } catch {}
-  return null;
+    return hlsUrl;
+  } finally {
+    await browser.close();
+  }
 }
-
-async function tryVidSrc(tmdbId, type) {
-  try {
-    const t = type === 'movie' ? 'movie' : 'tv';
-    const r = await fetch(`https://vidsrc.to/embed/${t}/${tmdbId}`);
-    if (r.status === 200) {
-      const m = r.data.match(/(https?:\/\/[^"']*\.(?:m3u8|mp4)[^"']*)/);
-      if (m) return { url: m[1], type: m[1].includes('.m3u8') ? 'hls' : 'mp4' };
-    }
-  } catch {}
-  return null;
-}
-
-const providers = [tryEmbedSu, tryMultiEmbed, tryVidSrc];
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
   if (req.method === 'OPTIONS') return res.end();
 
   const p = url.parse(req.url, true);
   const m = p.pathname.match(/^\/api\/streams\/(movie|tv)\/(\d+)/i);
-  if (!m) return res.writeHead(404).end(JSON.stringify({ error: 'Use /api/streams/movie/:id or /api/streams/tv/:id' }));
+  if (!m) {
+    if (p.pathname === '/api/health' || p.pathname === '/') return res.end(JSON.stringify({ ok: true }));
+    return res.writeHead(404).end(JSON.stringify({ error: 'Use /api/streams/movie/:id' }));
+  }
 
   const type = m[1];
   const tmdbId = m[2];
+  const t = type === 'movie' ? 'movie' : 'tv';
+  const results = {};
 
-  for (const provider of providers) {
-    const result = await provider(tmdbId, type);
-    if (result) return res.end(JSON.stringify({ streams: { proxy: result } }));
+  for (const prov of PROVIDERS) {
+    const pageUrl = prov.build(t, tmdbId);
+    try {
+      const hls = await extractFromBrowser(pageUrl);
+      results[prov.name] = hls || null;
+    } catch (e) {
+      results[prov.name] = null;
+    }
   }
 
-  res.end(JSON.stringify({ error: 'No stream available' }));
+  const streams = {};
+  for (const [name, hls] of Object.entries(results)) {
+    if (hls && (hls.includes('.m3u8') || hls.includes('.mp4'))) {
+      streams[name] = { url: hls, type: hls.includes('.m3u8') ? 'hls' : 'mp4' };
+    }
+  }
+
+  res.end(JSON.stringify({ success: true, tmdbId, count: Object.keys(streams).length, streams }));
 });
 
-server.listen(PORT, () => console.log(`DesiStream proxy on :${PORT}`));
+server.listen(PORT, () => console.log(`Playwright proxy on :${PORT}`));
